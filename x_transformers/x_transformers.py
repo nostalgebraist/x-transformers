@@ -48,6 +48,11 @@ def groupby_prefix_and_trim(prefix, d):
     kwargs_without_prefix = dict(map(lambda x: (x[0][len(prefix):], x[1]), tuple(kwargs_with_prefix.items())))
     return kwargs_without_prefix, kwargs
 
+def cum_mean(t, dim = -1):
+    device = t.device
+    running_num = torch.arange(t.shape[dim], device=t.device) + 1
+    return t.cumsum(dim = dim) / running_num
+
 # positional embeddings
 
 class RelativePositionBias(nn.Module):
@@ -201,6 +206,8 @@ class Attention(nn.Module):
             self.mem_k = nn.Parameter(torch.randn(heads, num_mem_kv, dim_head))
             self.mem_v = nn.Parameter(torch.randn(heads, num_mem_kv, dim_head))
 
+        self.attn_gates = nn.Parameter(torch.randn(heads, 2, 1))
+
         # attention on attention
         self.attn_on_attn = on_attn
         self.to_out = GEGLU(inner_dim * 2, dim) if on_attn else nn.Linear(inner_dim, dim)
@@ -250,6 +257,13 @@ class Attention(nn.Module):
             dots.masked_fill_(mask, mask_value)
             del mask
 
+        # get the mean and max of each attention row
+        # calculate attention gate logit
+        dots_mean = cum_mean(dots).diagonal(dim1 = -2, dim2 = -1)
+        dots_max = dots.max(dim = -1).values
+        dots_agg = torch.cat((dots_mean.unsqueeze(-1), dots_max.unsqueeze(-1)), dim = -1)
+        attn_gates = einsum('b h i j, h j k -> b h i k', dots_agg, self.attn_gates)
+
         if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
             top, _ = dots.topk(self.sparse_topk, dim = -1)
             vk = top[..., -1].unsqueeze(-1).expand_as(dots)
@@ -264,6 +278,10 @@ class Attention(nn.Module):
             attn = einsum('b h i j, h k -> b k i j', attn, self.post_softmax_proj).contiguous()
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
+
+        # gate by attention statistics
+        out = out * attn_gates.sigmoid()
+
         out = rearrange(out, 'b h n d -> b n (h d)')
 
         if self.attn_on_attn:
