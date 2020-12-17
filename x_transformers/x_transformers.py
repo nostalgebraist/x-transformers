@@ -179,12 +179,12 @@ class Attention(nn.Module):
         self.mask = mask
 
         inner_dim = dim_head * heads
-        self.to_q = nn.Linear(dim, inner_dim * 2, bias = False)
-        self.to_k = nn.Linear(dim, inner_dim * 2, bias = False)
+        self.to_q = nn.Linear(dim, inner_dim * 1, bias = False)
+        self.to_k = nn.Linear(dim, inner_dim * 1, bias = False)
         self.to_v = nn.Linear(dim, inner_dim * 1, bias = False)
         self.dropout = nn.Dropout(dropout)
 
-        self.attn_mlp = nn.Sequential(nn.Linear(2, 2), nn.GELU(), nn.Linear(2, 1))
+        self.attn_mlp = nn.Sequential(nn.Linear(dim_head, dim_head), nn.GELU(), nn.Linear(dim_head, 1))
 
         # talking heads
         self.talking_heads = talking_heads
@@ -215,7 +215,7 @@ class Attention(nn.Module):
         q_ = self.to_q(x)
         k, v = self.to_k(kv_input), self.to_v(kv_input)
 
-        q, k, = map(lambda t: rearrange(t, 'b n (h d v) -> b h n d v', h = h, v = 2), (q_, k))
+        q, k, = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q_, k))
         v = rearrange(v, 'b n (h d) -> b h n d', h = h)
 
         input_mask = None
@@ -234,7 +234,7 @@ class Attention(nn.Module):
             if exists(input_mask):
                 input_mask = F.pad(input_mask, (self.num_mem_kv, 0), value = True)
 
-        dots = einsum('b h i d v, b h j d v -> b h i j v', q, k) * self.scale
+        dots = (q[..., :, None, :] - k[..., None, :, :])
         dots = self.attn_mlp(dots).squeeze(dim = -1)
 
         mask_value = max_neg_value(dots)
