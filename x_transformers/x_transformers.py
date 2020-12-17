@@ -179,8 +179,8 @@ class Attention(nn.Module):
         self.mask = mask
 
         inner_dim = dim_head * heads
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+        self.to_q = nn.Linear(dim, inner_dim * 2, bias = False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2 * 2, bias = False)
         self.dropout = nn.Dropout(dropout)
 
         # talking heads
@@ -212,15 +212,15 @@ class Attention(nn.Module):
         q_ = self.to_q(x)
         kv = self.to_kv(kv_input).chunk(2, dim = -1)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q_, *kv))
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d v) -> b h n d v', h = h, v = 2), (q_, *kv))
 
         input_mask = None
         if any(map(exists, (mask, context_mask))):
             q_mask = default(mask, lambda: torch.ones((b, n), device = device).bool())
             k_mask = q_mask if not exists(context) else context_mask
             k_mask = default(k_mask, lambda: torch.ones((b, k.shape[-2]), device = device).bool())
-            q_mask = rearrange(q_mask, 'b i -> b () i ()')
-            k_mask = rearrange(k_mask, 'b j -> b () () j')
+            q_mask = rearrange(q_mask, 'b i -> b () i () ()')
+            k_mask = rearrange(k_mask, 'b j -> b () () j ()')
             input_mask = q_mask * k_mask
 
         if self.num_mem_kv > 0:
@@ -230,8 +230,7 @@ class Attention(nn.Module):
             if exists(input_mask):
                 input_mask = F.pad(input_mask, (self.num_mem_kv, 0), value = True)
 
-        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-
+        dots = einsum('b h i d v, b h j d v -> b h i j v', q, k) * self.scale
         mask_value = max_neg_value(dots)
 
         if talking_heads:
@@ -257,13 +256,13 @@ class Attention(nn.Module):
             dots.masked_fill_(mask, mask_value)
             del mask
 
-        attn = self.attn_fn(dots, dim = -1)
+        attn = self.attn_fn(dots, dim = -2)
         attn = self.dropout(attn)
 
         if talking_heads:
             attn = einsum('b h i j, h k -> b k i j', attn, self.post_softmax_proj).contiguous()
 
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = einsum('b h i j v, b h j d v-> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
 
         return self.to_out(out)
