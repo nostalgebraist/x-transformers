@@ -180,7 +180,8 @@ class Attention(nn.Module):
 
         inner_dim = dim_head * heads
         self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+        self.to_k = nn.Linear(dim, inner_dim, bias = False)
+        self.to_v = nn.Linear(dim, inner_dim, bias = False)
         self.dropout = nn.Dropout(dropout)
 
         # talking heads
@@ -205,14 +206,15 @@ class Attention(nn.Module):
         self.attn_on_attn = on_attn
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim * 2), nn.GLU()) if on_attn else nn.Linear(inner_dim, dim)
 
-    def forward(self, x, context = None, mask = None, context_mask = None, rel_pos = None, prev_attn = None):
+    def forward(self, x, pos_emb = 0, context = None, mask = None, context_mask = None, rel_pos = None, prev_attn = None):
         b, n, _, h, talking_heads, device = *x.shape, self.heads, self.talking_heads, x.device
         kv_input = default(context, x)
 
-        q_ = self.to_q(x)
-        kv = self.to_kv(kv_input).chunk(2, dim = -1)
+        q_ = self.to_q(x + pos_emb)
+        k = self.to_k(kv_input + pos_emb)
+        v = self.to_v(kv_input)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q_, *kv))
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q_, k, v))
 
         input_mask = None
         if any(map(exists, (mask, context_mask))):
@@ -350,7 +352,7 @@ class AttentionLayers(nn.Module):
                 layer
             ]))
 
-    def forward(self, x, context = None, mask = None, context_mask = None):
+    def forward(self, x, pos_emb = 0, context = None, mask = None, context_mask = None):
         prev_attn = None
         prev_cross_attn = None
 
@@ -361,7 +363,7 @@ class AttentionLayers(nn.Module):
                 x = norm(x)
 
             if layer_type == 'a':
-                out, pre_attn = block(x, mask = mask, rel_pos = self.rel_pos, prev_attn = prev_attn)
+                out, pre_attn = block(x, pos_emb = pos_emb, mask = mask, rel_pos = self.rel_pos, prev_attn = prev_attn)
             elif layer_type == 'c':
                 out, pre_attn = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
@@ -484,7 +486,7 @@ class TransformerWrapper(nn.Module):
     def forward(self, x, return_embeddings = False, mask = None, **kwargs):
         b, n, device, num_mem = *x.shape, x.device, self.num_memory_tokens
         x = self.token_emb(x)
-        x += self.pos_emb(torch.arange(n, device = device))
+        pos_emb = self.pos_emb(torch.arange(n, device = device))
         x = self.emb_dropout(x)
 
         if num_mem > 0:
@@ -495,7 +497,7 @@ class TransformerWrapper(nn.Module):
             if exists(mask):
                 mask = F.pad(mask, (num_mem, 0), value = True)
 
-        x = self.attn_layers(x, mask = mask, **kwargs)
+        x = self.attn_layers(x, pos_emb = pos_emb, mask = mask, **kwargs)
         x = self.norm(x)
 
         mem, x = x[:, :num_mem], x[:, num_mem:]
