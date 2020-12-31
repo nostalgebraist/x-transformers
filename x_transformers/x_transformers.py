@@ -50,6 +50,18 @@ def groupby_prefix_and_trim(prefix, d):
 
 # positional embeddings
 
+class FixedPositionalEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, x):
+        t = torch.arange(x.shape[1], device=x.device).type_as(self.inv_freq)
+        sinusoid_inp = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
+        return emb[None, :, :]
+
 class RelativePositionBias(nn.Module):
     def __init__(self, causal = False, num_buckets = 32, max_distance = 128, heads = 8):
         super().__init__()
@@ -458,7 +470,7 @@ class TransformerWrapper(nn.Module):
         dim = attn_layers.dim
         self.max_seq_len = max_seq_len
         self.token_emb = nn.Embedding(num_tokens, dim)
-        self.pos_emb = nn.Embedding(max_seq_len, dim)
+        self.pos_emb = FixedPositionalEmbedding(dim)
         self.emb_dropout = nn.Dropout(emb_dropout)
 
         self.attn_layers = attn_layers
@@ -481,12 +493,12 @@ class TransformerWrapper(nn.Module):
 
     def init_(self):
         nn.init.normal_(self.token_emb.weight, std = 0.02)
-        nn.init.normal_(self.pos_emb.weight, std = 0.02)
+        # nn.init.normal_(self.pos_emb.weight, std = 0.02)
 
     def forward(self, x, return_embeddings = False, mask = None, **kwargs):
         b, n, device, num_mem = *x.shape, x.device, self.num_memory_tokens
         x = self.token_emb(x)
-        pos_emb = self.pos_emb(torch.arange(n, device = device))
+        pos_emb = self.pos_emb(x)
         x = self.emb_dropout(x)
 
         if num_mem > 0:
