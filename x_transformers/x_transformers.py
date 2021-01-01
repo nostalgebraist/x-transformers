@@ -76,7 +76,7 @@ class FixedPositionalEmbedding(nn.Module):
 
     def forward(self, x):
         t = torch.arange(x.shape[1], device=x.device).type_as(self.inv_freq)
-        sinusoid_inp = torch.einsum("i,j->ij", t, self.inv_freq)
+        sinusoid_inp = torch.einsum('i , j -> i j', t, self.inv_freq)
         emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
         return emb[None, :, :]
 
@@ -203,7 +203,7 @@ class Attention(nn.Module):
         on_attn = False
     ):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head ** -0.5 * 0.5
         self.heads = heads
         self.causal = causal
         self.mask = mask
@@ -236,7 +236,7 @@ class Attention(nn.Module):
         self.attn_on_attn = on_attn
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim * 2), nn.GLU()) if on_attn else nn.Linear(inner_dim, dim)
 
-    def forward(self, x, context = None, mask = None, context_mask = None, rel_pos = None, pia_emb = 0, prev_attn = None, mem = None):
+    def forward(self, x, context = None, mask = None, context_mask = None, rel_pos = None, pia_emb = 0, prev_attn = None, mem = None, attn_bias = None):
         b, n, _, h, talking_heads, device = *x.shape, self.heads, self.talking_heads, x.device
         kv_input = default(context, x)
 
@@ -277,6 +277,9 @@ class Attention(nn.Module):
             dots = dots + prev_attn
 
         pre_softmax_attn = dots
+
+        if exists(attn_bias):
+            dots = dots + attn_bias
 
         if talking_heads:
             dots = einsum('b h i j, h k -> b k i j', dots, self.pre_softmax_proj).contiguous()
@@ -335,6 +338,7 @@ class AttentionLayers(nn.Module):
     ):
         super().__init__()
         self.dim = dim
+        self.heads = heads
         self.depth = depth
         self.layers = nn.ModuleList([])
 
@@ -395,7 +399,7 @@ class AttentionLayers(nn.Module):
                 layer
             ]))
 
-    def forward(self, x, context = None, mask = None, context_mask = None, mems = None, return_hiddens = False):
+    def forward(self, x, context = None, mask = None, context_mask = None, mems = None, return_hiddens = False, attn_bias = None):
         hiddens = []
         prev_attn = None
         prev_cross_attn = None
@@ -415,7 +419,7 @@ class AttentionLayers(nn.Module):
                 x = norm(x)
 
             if layer_type == 'a':
-                out, pre_attn = block(x, mask = mask, pia_emb = pos_emb, rel_pos = self.rel_pos, prev_attn = prev_attn, mem = layer_mem)
+                out, pre_attn = block(x, mask = mask, pia_emb = pos_emb, rel_pos = self.rel_pos, prev_attn = prev_attn, mem = layer_mem, attn_bias = attn_bias)
             elif layer_type == 'c':
                 out, pre_attn = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
@@ -516,12 +520,18 @@ class TransformerWrapper(nn.Module):
         assert isinstance(attn_layers, AttentionLayers), 'attention layers must be one of Encoder or Decoder'
 
         dim = attn_layers.dim
+        heads = attn_layers.heads
+        self.heads = heads
+
         self.max_seq_len = max_seq_len
         self.max_mem_len = max_mem_len
 
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.pos_emb = AbsolutePositionalEmbedding(dim, max_seq_len) if (use_pos_emb and not attn_layers.has_pos_emb) else always(0)
         self.emb_dropout = nn.Dropout(emb_dropout)
+
+        self.Uq = nn.Linear(dim, dim, bias = False)
+        self.Uk = nn.Linear(dim, dim, bias = False)
 
         self.attn_layers = attn_layers
         self.norm = nn.LayerNorm(dim)
@@ -547,8 +557,15 @@ class TransformerWrapper(nn.Module):
     def forward(self, x, return_embeddings = False, mask = None, return_mems = False, mems = None, **kwargs):
         b, n, device, num_mem = *x.shape, x.device, self.num_memory_tokens
         x = self.token_emb(x)
-        x += self.pos_emb(x)
         x = self.emb_dropout(x)
+
+        h = self.heads
+        pos_emb = self.pos_emb(x)
+        Pq = self.Uq(pos_emb)
+        Pk = self.Uk(pos_emb)
+
+        Pq, Pk = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (Pq, Pk))
+        Pattn = einsum('b h i d, b h j d -> b h i j', Pq, Pk) * (Pq.shape[-1] ** -0.5) * 0.5
 
         if num_mem > 0:
             mem = repeat(self.memory_tokens, 'n d -> b n d', b = b)
@@ -558,7 +575,7 @@ class TransformerWrapper(nn.Module):
             if exists(mask):
                 mask = F.pad(mask, (num_mem, 0), value = True)
 
-        x, hiddens = self.attn_layers(x, mask = mask, mems = mems, return_hiddens = True, **kwargs)
+        x, hiddens = self.attn_layers(x, attn_bias = Pattn, mask = mask, mems = mems, return_hiddens = True, **kwargs)
         x = self.norm(x)
 
         mem, x = x[:, :num_mem], x[:, num_mem:]
