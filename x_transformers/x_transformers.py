@@ -91,6 +91,24 @@ class AbsolutePositionalEmbedding(nn.Module):
         n = torch.arange(x.shape[1], device = x.device)
         return self.emb(n)[None, :, :]
 
+def rotate_every_two(x):
+    x = rearrange(x, '... (d j) -> ... d j', j = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d j -> ... (d j)')
+
+def apply_rotory_pos_emb(q, k, sinu_pos):
+    sinu_pos = rearrange(sinu_pos, '() n (d j) -> n d j', j = 2)
+    sin, cos = sinu_pos.unbind(dim = -1)
+    sin, cos = map(lambda t: repeat(t, 'b n -> b (n j)', j = 2), (sin, cos))
+
+    q_rotated = rotate_every_two(q)
+    k_rotated = rotate_every_two(k)
+
+    q = (q * cos) + (q_rotated * sin)
+    k = (k * cos) + (k_rotated * sin)
+    return q, k
+
 class FixedPositionalEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -100,8 +118,8 @@ class FixedPositionalEmbedding(nn.Module):
     def forward(self, x, seq_dim = 1, offset = 0):
         t = torch.arange(x.shape[seq_dim], device = x.device).type_as(self.inv_freq) + offset
         sinusoid_inp = torch.einsum('i , j -> i j', t, self.inv_freq)
-        emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
-        return emb[None, :, :]
+        emb = torch.stack((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
+        return rearrange(emb, 'n d j -> () n (d j)')
 
 class RelativePositionBias(nn.Module):
     def __init__(self, causal = False, num_buckets = 32, max_distance = 128, heads = 8):
@@ -307,17 +325,20 @@ class Attention(nn.Module):
             k_input = torch.cat((mem, k_input), dim = -2)
             v_input = torch.cat((mem, v_input), dim = -2)
 
-        if exists(sinusoidal_emb):
-            # in shortformer, the query would start at a position offset depending on the past cached memory
-            offset = k_input.shape[-2] - q_input.shape[-2]
-            q_input = q_input + sinusoidal_emb(q_input, offset = offset)
-            k_input = k_input + sinusoidal_emb(k_input)
+        # if exists(sinusoidal_emb):
+        #     # in shortformer, the query would start at a position offset depending on the past cached memory
+        #     offset = k_input.shape[-2] - q_input.shape[-2]
+        #     q_input = q_input + sinusoidal_emb(q_input, offset = offset)
+        #     k_input = k_input + sinusoidal_emb(k_input)
 
         q = self.to_q(q_input)
         k = self.to_k(k_input)
         v = self.to_v(v_input)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+
+        if exists(sinusoidal_emb):
+            q, k = apply_rotory_pos_emb(q, k, sinusoidal_emb)
 
         input_mask = None
         if any(map(exists, (mask, context_mask))):
@@ -399,7 +420,7 @@ class AttentionLayers(nn.Module):
         rel_pos_bias = False,
         rel_pos_num_buckets = 32,
         rel_pos_max_distance = 128,
-        position_infused_attn = False,
+        position_infused_attn = True,
         custom_layers = None,
         sandwich_coef = None,
         par_ratio = None,
@@ -416,7 +437,7 @@ class AttentionLayers(nn.Module):
         self.layers = nn.ModuleList([])
 
         self.has_pos_emb = position_infused_attn or rel_pos_bias
-        self.pia_pos_emb = FixedPositionalEmbedding(dim) if position_infused_attn else None
+        self.pia_pos_emb = FixedPositionalEmbedding(kwargs['attn_dim_head']) if position_infused_attn else None
 
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
         self.rel_pos = RelativePositionBias(causal = causal, heads = heads, num_buckets = rel_pos_num_buckets, max_distance = rel_pos_max_distance) if rel_pos_bias else None
@@ -522,7 +543,7 @@ class AttentionLayers(nn.Module):
                 x = norm(x)
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, sinusoidal_emb = self.pia_pos_emb, rel_pos = self.rel_pos, prev_attn = prev_attn, mem = layer_mem)
+                out, inter = block(x, mask = mask, sinusoidal_emb = self.pia_pos_emb(x), rel_pos = self.rel_pos, prev_attn = prev_attn, mem = layer_mem)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
