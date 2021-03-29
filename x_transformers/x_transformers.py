@@ -204,6 +204,16 @@ class RMSNorm(nn.Module):
         norm = torch.norm(x, dim = -1, keepdim = True) * self.scale
         return x / norm.clamp(min = self.eps) * self.g
 
+class FiLMResidual(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine = False)
+
+    def forward(self, x, residual):
+        residual = self.norm(residual)
+        g, b = x.chunk(2, dim = -1)
+        return residual * g + b
+
 class Residual(nn.Module):
     def forward(self, x, residual):
         return x + residual
@@ -300,7 +310,7 @@ class Attention(nn.Module):
 
         # attention on attention
         self.attn_on_attn = on_attn
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim * 2), nn.GLU()) if on_attn else nn.Linear(inner_dim, dim)
+        self.to_out = nn.Linear(inner_dim, dim * 2)
 
     def forward(
         self,
@@ -508,10 +518,13 @@ class AttentionLayers(nn.Module):
             if isinstance(layer, Attention) and exists(branch_fn):
                 layer = branch_fn(layer)
 
-            if gate_residual:
-                residual_fn = GRUGating(dim)
+            if layer_type == 'a' or layer_type == 'c':
+                residual_fn = FiLMResidual(dim)
             else:
-                residual_fn = Residual()
+                if gate_residual:
+                    residual_fn = GRUGating(dim)
+                else:
+                    residual_fn = Residual()
 
             self.layers.append(nn.ModuleList([
                 norm_fn(),
