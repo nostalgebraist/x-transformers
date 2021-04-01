@@ -160,6 +160,26 @@ def apply_rotary_pos_emb(q, k, sinu_pos):
     q, k = map(lambda t: (t * cos) + (rotate_every_two(t) * sin), (q, k))
     return q, k
 
+# rescaling branch, for deep transformers
+
+class LayerScale(nn.Module):
+    def __init__(self, dim, fn, depth = None):
+        super().__init__()
+        self.fn = fn
+        self.g = nn.Parameter(torch.tensor(0.1))
+    def forward(self, x, **kwargs):
+        x, *rest = self.fn(x, **kwargs)
+        return (x * self.g, *rest)
+
+class Rezero(nn.Module):
+    def __init__(self, fn, depth = None):
+        super().__init__()
+        self.fn = fn
+        self.g = nn.Parameter(torch.tensor(0.1))
+    def forward(self, x, **kwargs):
+        x, *rest = self.fn(x, **kwargs)
+        return (x * self.g, *rest)
+
 # classes
 
 class Scale(nn.Module):
@@ -171,16 +191,6 @@ class Scale(nn.Module):
     def forward(self, x, **kwargs):
         x, *rest = self.fn(x, **kwargs)
         return (x * self.value, *rest)
-
-class Rezero(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-        self.g = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x, **kwargs):
-        x, *rest = self.fn(x, **kwargs)
-        return (x * self.g, *rest)
 
 class ScaleNorm(nn.Module):
     def __init__(self, dim, eps = 1e-5):
@@ -417,6 +427,7 @@ class AttentionLayers(nn.Module):
         use_scalenorm = False,
         use_rmsnorm = False,
         use_rezero = False,
+        use_layerscale = False,
         rel_pos_bias = False,
         rel_pos_num_buckets = 32,
         rel_pos_max_distance = 128,
@@ -461,6 +472,8 @@ class AttentionLayers(nn.Module):
 
         norm_fn = nn.Identity if use_rezero else norm_fn
         branch_fn = Rezero if use_rezero else None
+
+        branch_fn = partial(LayerScale, dim) if use_layerscale else None
 
         if cross_attend and not only_cross:
             default_block = ('a', 'c', 'f')
