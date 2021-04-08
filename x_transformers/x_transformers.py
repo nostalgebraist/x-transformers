@@ -312,7 +312,8 @@ class Attention(nn.Module):
         sinusoidal_emb = None,
         rotary_pos_emb = None,
         prev_attn = None,
-        mem = None
+        mem = None,
+        cached_attn = None,
     ):
         b, n, _, h, talking_heads, device = *x.shape, self.heads, self.talking_heads, x.device
         kv_input = default(context, x)
@@ -325,11 +326,11 @@ class Attention(nn.Module):
             k_input = torch.cat((mem, k_input), dim = -2)
             v_input = torch.cat((mem, v_input), dim = -2)
 
-        if exists(sinusoidal_emb):
-            # in shortformer, the query would start at a position offset depending on the past cached memory
-            offset = k_input.shape[-2] - q_input.shape[-2]
-            q_input = q_input + sinusoidal_emb(q_input, offset = offset)
-            k_input = k_input + sinusoidal_emb(k_input)
+        # if exists(sinusoidal_emb):
+        #     # in shortformer, the query would start at a position offset depending on the past cached memory
+        #     offset = k_input.shape[-2] - q_input.shape[-2]
+        #     q_input = q_input + sinusoidal_emb(q_input, offset = offset)
+        #     k_input = k_input + sinusoidal_emb(k_input)
 
         q = self.to_q(q_input)
         k = self.to_k(k_input)
@@ -337,8 +338,8 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
-        if exists(rotary_pos_emb):
-            q, k = apply_rotary_pos_emb(q, k, rotary_pos_emb)
+        # if exists(rotary_pos_emb):
+        #     q, k = apply_rotary_pos_emb(q, k, rotary_pos_emb)
 
         input_mask = None
         if any(map(exists, (mask, context_mask))):
@@ -389,6 +390,9 @@ class Attention(nn.Module):
 
         attn = self.attn_fn(dots, dim = -1)
         post_softmax_attn = attn
+
+        if exists(cached_attn):
+            attn = cached_attn
 
         attn = self.dropout(attn)
 
@@ -537,7 +541,11 @@ class AttentionLayers(nn.Module):
 
         rotary_pos_emb = self.rotary_pos_emb(x)
 
+        cached_attn = None
+
         for ind, (layer_type, (norm, block, residual_fn)) in enumerate(zip(self.layer_types, self.layers)):
+            cache_attn = ind % 4 == 0
+
             is_last = ind == (len(self.layers) - 1)
 
             if layer_type == 'a':
@@ -550,11 +558,16 @@ class AttentionLayers(nn.Module):
                 x = norm(x)
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, sinusoidal_emb = self.pia_pos_emb, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem)
+                out, inter = block(x, mask = mask, sinusoidal_emb = self.pia_pos_emb, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem, cached_attn = cached_attn)
+                cached_attn = None
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
                 out = block(x)
+
+            if cache_attn:
+                cached_attn = None # inter.post_softmax_attn
+
 
             x = residual_fn(out, residual)
 
