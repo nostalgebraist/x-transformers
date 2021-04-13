@@ -680,7 +680,7 @@ class TransformerWrapper(nn.Module):
         self.max_mem_len = max_mem_len
 
         self.token_emb = nn.Embedding(num_tokens, emb_dim)
-        self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len) if (use_pos_emb and not attn_layers.has_pos_emb) else always(0)
+        # self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len) if (use_pos_emb and not attn_layers.has_pos_emb) else always(0)
         self.emb_dropout = nn.Dropout(emb_dropout)
 
         self.project_emb = nn.Linear(emb_dim, dim) if emb_dim != dim else nn.Identity()
@@ -717,7 +717,7 @@ class TransformerWrapper(nn.Module):
     ):
         b, n, device, num_mem = *x.shape, x.device, self.num_memory_tokens
         x = self.token_emb(x)
-        x += self.pos_emb(x)
+        # x += self.pos_emb(x)
         x = self.emb_dropout(x)
 
         x = self.project_emb(x)
