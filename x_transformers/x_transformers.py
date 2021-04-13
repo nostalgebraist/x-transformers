@@ -275,7 +275,15 @@ class Attention(nn.Module):
         self.mask = mask
 
         inner_dim = dim_head * heads
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+
+        from einops.layers.torch import Rearrange
+
+        self.to_q = nn.Sequential(
+            Rearrange('b n d -> b d n'),
+            nn.Conv1d(dim, inner_dim, 32, bias = False),
+            Rearrange('b d n -> b n d')
+        )
+
         self.to_k = nn.Linear(dim, inner_dim, bias = False)
         self.to_v = nn.Linear(dim, inner_dim, bias = False)
         self.dropout = nn.Dropout(dropout)
@@ -317,7 +325,7 @@ class Attention(nn.Module):
         b, n, _, h, talking_heads, device = *x.shape, self.heads, self.talking_heads, x.device
         kv_input = default(context, x)
 
-        q_input = x
+        q_input = F.pad(x, (0, 0, 31, 0), value = 0)
         k_input = kv_input
         v_input = kv_input
 
