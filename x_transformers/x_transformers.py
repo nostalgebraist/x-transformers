@@ -332,7 +332,8 @@ class Attention(nn.Module):
         sinusoidal_emb = None,
         rotary_pos_emb = None,
         prev_attn = None,
-        mem = None
+        mem = None,
+        tupe_sim = None
     ):
         b, n, _, h, talking_heads, device = *x.shape, self.heads, self.talking_heads, x.device
         kv_input = default(context, x)
@@ -389,6 +390,9 @@ class Attention(nn.Module):
 
         if exists(rel_pos):
             dots = rel_pos(dots)
+
+        if exists(tupe_sim):
+            dots = dots + tupe_sim
 
         if exists(input_mask):
             dots.masked_fill_(~input_mask, mask_value)
@@ -463,6 +467,7 @@ class AttentionLayers(nn.Module):
         self.dim = dim
         self.depth = depth
         self.layers = nn.ModuleList([])
+        self.heads = heads
 
         self.has_pos_emb = position_infused_attn or rel_pos_bias or rotary_pos_emb
         self.pia_pos_emb = FixedPositionalEmbedding(dim) if position_infused_attn else None
@@ -471,6 +476,9 @@ class AttentionLayers(nn.Module):
 
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
         self.rel_pos = RelativePositionBias(causal = causal, heads = heads, num_buckets = rel_pos_num_buckets, max_distance = rel_pos_max_distance) if rel_pos_bias else None
+
+        self.tupe_q = nn.Linear(dim, dim_head * heads, bias = False)
+        self.tupe_k = nn.Linear(dim, dim_head * heads, bias = False)
 
         self.pre_norm = pre_norm
 
@@ -548,7 +556,8 @@ class AttentionLayers(nn.Module):
         mask = None,
         context_mask = None,
         mems = None,
-        return_hiddens = False
+        return_hiddens = False,
+        abs_pos = None
     ):
         hiddens = []
         intermediates = []
@@ -558,6 +567,13 @@ class AttentionLayers(nn.Module):
         mems = mems.copy() if exists(mems) else [None] * self.num_attn_layers
 
         rotary_pos_emb = self.rotary_pos_emb(x)
+
+        tupe_sim = None
+        if exists(abs_pos):
+            abs_q = self.tupe_q(abs_pos)
+            abs_k = self.tupe_k(abs_pos)
+            abs_q, abs_k = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (abs_q, abs_k))
+            tupe_sim = einsum('b h i d, b h j d -> b h i j', abs_q, abs_k) * (abs_q.shape[-1] ** -0.5)
 
         for ind, (layer_type, (norm, block, residual_fn)) in enumerate(zip(self.layer_types, self.layers)):
             is_last = ind == (len(self.layers) - 1)
@@ -572,7 +588,7 @@ class AttentionLayers(nn.Module):
                 x = norm(x)
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, sinusoidal_emb = self.pia_pos_emb, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem)
+                out, inter = block(x, mask = mask, sinusoidal_emb = self.pia_pos_emb, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem, tupe_sim = tupe_sim)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
@@ -692,7 +708,7 @@ class TransformerWrapper(nn.Module):
         self.max_mem_len = max_mem_len
 
         self.token_emb = nn.Embedding(num_tokens, emb_dim)
-        self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len) if (use_pos_emb and not attn_layers.has_pos_emb) else always(0)
+        self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len)
         self.emb_dropout = nn.Dropout(emb_dropout)
 
         self.project_emb = nn.Linear(emb_dim, dim) if emb_dim != dim else nn.Identity()
@@ -729,7 +745,7 @@ class TransformerWrapper(nn.Module):
     ):
         b, n, device, num_mem = *x.shape, x.device, self.num_memory_tokens
         x = self.token_emb(x)
-        x += self.pos_emb(x)
+        abs_pos = self.pos_emb(x)
         x = self.emb_dropout(x)
 
         x = self.project_emb(x)
@@ -742,7 +758,7 @@ class TransformerWrapper(nn.Module):
             if exists(mask):
                 mask = F.pad(mask, (num_mem, 0), value = True)
 
-        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, return_hiddens = True, **kwargs)
+        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, return_hiddens = True, abs_pos = abs_pos, **kwargs)
         x = self.norm(x)
 
         mem, x = x[:, :num_mem], x[:, num_mem:]
