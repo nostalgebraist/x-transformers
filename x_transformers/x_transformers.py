@@ -164,11 +164,10 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
 
-    def forward(self, x, seq_dim = 1):
-        t = torch.arange(x.shape[seq_dim], device = x.device).type_as(self.inv_freq)
-        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
+    def forward(self, t):
+        freqs = torch.einsum('b i , j -> b i j', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb[None, :, :]
+        return rearrange(emb, 'b i j -> b () i j')
 
 def rotate_half(x):
     x = rearrange(x, '... (j d) -> ... j d', j = 2)
@@ -295,6 +294,14 @@ class Attention(nn.Module):
 
         inner_dim = dim_head * heads
 
+        self.rotary_pos_emb = RotaryEmbedding(dim_head)
+
+        self.to_width = nn.Sequential(
+            nn.Linear(dim, 1, bias = False),
+            Rearrange('... () -> ...'),
+            nn.Sigmoid()
+        )
+
         self.to_q = nn.Linear(dim, inner_dim, bias = False)
         self.to_k = nn.Linear(dim, inner_dim, bias = False)
         self.to_v = nn.Linear(dim, inner_dim, bias = False)
@@ -357,12 +364,14 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
-        if exists(rotary_pos_emb):
-            l = rotary_pos_emb.shape[-1]
-            (ql, qr), (kl, kr) = map(lambda t: (t[..., :l], t[..., l:]), (q, k))
-            ql, kl = apply_rotary_pos_emb(ql, kl, rotary_pos_emb)
-            q = torch.cat((ql, qr), dim = -1)
-            k = torch.cat((kl, kr), dim = -1)
+        token_widths = self.to_width(x).cumsum(dim = -1)
+        rotary_pos_emb = self.rotary_pos_emb(token_widths)
+
+        l = rotary_pos_emb.shape[-1]
+        (ql, qr), (kl, kr) = map(lambda t: (t[..., :l], t[..., l:]), (q, k))
+        ql, kl = apply_rotary_pos_emb(ql, kl, rotary_pos_emb)
+        q = torch.cat((ql, qr), dim = -1)
+        k = torch.cat((kl, kr), dim = -1)
 
         input_mask = None
         if any(map(exists, (mask, context_mask))):
@@ -473,7 +482,7 @@ class AttentionLayers(nn.Module):
         self.pia_pos_emb = FixedPositionalEmbedding(dim) if position_infused_attn else None
 
         rotary_emb_dim = max(default(rotary_emb_dim, dim_head // 2), 32)
-        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim) if rotary_pos_emb else always(None)
+        self.rotary_pos_emb = always(None)
 
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
         self.rel_pos = RelativePositionBias(causal = causal, heads = heads, num_buckets = rel_pos_num_buckets, max_distance = rel_pos_max_distance) if rel_pos_bias else None
