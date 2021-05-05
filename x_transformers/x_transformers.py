@@ -431,6 +431,27 @@ class Attention(nn.Module):
 
         return self.to_out(out), intermediates
 
+class MaskedMixer(torch.nn.Module):
+    def __init__(self, seq, expansion):
+        super().__init__()
+
+        self.input_proj = torch.nn.Linear(seq, seq * expansion)
+        self.input_proj_gate = torch.nn.Linear(seq, seq * expansion)
+        self.output_proj = torch.nn.Linear(seq * expansion, seq)
+        self.act = torch.nn.GELU()
+        self.register_buffer('in_mask', torch.triu(torch.ones((seq, seq))).repeat_interleave(expansion, dim=1).t())
+        self.register_buffer('out_mask', torch.tril(torch.ones((seq, seq))).repeat_interleave(expansion, dim=1))
+
+    def forward(self, x, **kwargs):
+        x_ = rearrange(x, 'b n d -> b d n')
+        x = torch.einsum("o i, b n i -> b n o", self.input_proj.weight * self.in_mask, x_)
+        g = torch.einsum("o i, b n i -> b n o", self.input_proj_gate.weight * self.in_mask, x_)
+        x = self.act(g) * x
+        x = torch.einsum("o i, b n i -> b n o", self.output_proj.weight * self.out_mask, x)
+        x = rearrange(x, 'b d n -> b n d')
+
+        return x
+
 class DsConvMLP(nn.Module):
     def __init__(
         self,
@@ -439,7 +460,7 @@ class DsConvMLP(nn.Module):
         kernel_size = 256
     ):
         super().__init__()
-        self.conv_in = nn.Conv1d(1, mult, kernel_size)
+        self.conv_in = nn.Conv1d(1, mult * 2, kernel_size)
         self.nonlin = nn.GELU()
         self.conv_out = nn.Conv1d(mult, 1, kernel_size)
 
@@ -448,7 +469,8 @@ class DsConvMLP(nn.Module):
         x = rearrange(x, 'b n d -> (b d) () n')
         x = F.pad(x, (n - 1, 0), value = 0.)
         x = self.conv_in(x)
-        x = self.nonlin(x)
+        x, gates = x.chunk(2, dim = 1)
+        x = self.nonlin(x) * gates
         x = F.pad(x, (n - 1, 0), value = 0.)
         x = self.conv_out(x)
         x = rearrange(x, '(b d) () n -> b n d', b = b)
@@ -554,7 +576,7 @@ class AttentionLayers(nn.Module):
                 layer = FeedForward(dim, **ff_kwargs)
                 layer = layer if not macaron else Scale(0.5, layer)
             elif layer_type == 'd':
-                layer = DsConvMLP(dim)
+                layer = MaskedMixer(256, 4)
             else:
                 raise Exception(f'invalid layer type {layer_type}')
 
