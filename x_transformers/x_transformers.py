@@ -436,18 +436,18 @@ class MaskedMixer(torch.nn.Module):
         super().__init__()
 
         self.input_proj = torch.nn.Linear(seq, seq * expansion)
-        self.input_proj_gate = torch.nn.Linear(seq, seq * expansion)
         self.output_proj = torch.nn.Linear(seq * expansion, seq)
         self.act = torch.nn.GELU()
         self.register_buffer('in_mask', torch.triu(torch.ones((seq, seq))).repeat_interleave(expansion, dim=1).t())
+        self.in_mask *= torch.sqrt(self.in_mask.shape[1] / self.in_mask.sum(axis=1, keepdim=True))
         self.register_buffer('out_mask', torch.tril(torch.ones((seq, seq))).repeat_interleave(expansion, dim=1))
+        self.out_mask *= torch.sqrt(self.out_mask.shape[1] / self.out_mask.sum(axis=1, keepdim=True))
 
     def forward(self, x, **kwargs):
         x_ = rearrange(x, 'b n d -> b d n')
-        x = torch.einsum("o i, b n i -> b n o", self.input_proj.weight * self.in_mask, x_)
-        g = torch.einsum("o i, b n i -> b n o", self.input_proj_gate.weight * self.in_mask, x_)
-        x = self.act(g) * x
-        x = torch.einsum("o i, b n i -> b n o", self.output_proj.weight * self.out_mask, x)
+        x = F.linear(x_, self.input_proj.weight * self.in_mask, self.input_proj.bias)
+        x = self.act(x)
+        x = F.linear(x, self.output_proj.weight * self.out_mask, self.output_proj.bias)
         x = rearrange(x, 'b d n -> b n d')
 
         return x
