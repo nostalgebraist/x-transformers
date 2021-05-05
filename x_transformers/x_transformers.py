@@ -431,6 +431,29 @@ class Attention(nn.Module):
 
         return self.to_out(out), intermediates
 
+class DsConvMLP(nn.Module):
+    def __init__(
+        self,
+        dim,
+        mult = 4,
+        kernel_size = 256
+    ):
+        super().__init__()
+        self.conv_in = nn.Conv1d(1, mult, kernel_size)
+        self.nonlin = nn.GELU()
+        self.conv_out = nn.Conv1d(mult, 1, kernel_size)
+
+    def forward(self, x):
+        b, n, d = x.shape
+        x = rearrange(x, 'b n d -> (b d) () n')
+        x = F.pad(x, (n - 1, 0), value = 0.)
+        x = self.conv_in(x)
+        x = self.nonlin(x)
+        x = F.pad(x, (n - 1, 0), value = 0.)
+        x = self.conv_out(x)
+        x = rearrange(x, '(b d) () n -> b n d', b = b)
+        return x
+
 class AttentionLayers(nn.Module):
     def __init__(
         self,
@@ -495,7 +518,7 @@ class AttentionLayers(nn.Module):
         elif cross_attend and only_cross:
             default_block = ('c', 'f')
         else:
-            default_block = ('a', 'f')
+            default_block = ('d', 'f')
 
         if macaron:
             default_block = ('f',) + default_block
@@ -530,6 +553,8 @@ class AttentionLayers(nn.Module):
             elif layer_type == 'f':
                 layer = FeedForward(dim, **ff_kwargs)
                 layer = layer if not macaron else Scale(0.5, layer)
+            elif layer_type == 'd':
+                layer = DsConvMLP(dim)
             else:
                 raise Exception(f'invalid layer type {layer_type}')
 
@@ -582,6 +607,8 @@ class AttentionLayers(nn.Module):
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
+                out = block(x)
+            elif layer_type == 'd':
                 out = block(x)
 
             x = residual_fn(out, residual)
