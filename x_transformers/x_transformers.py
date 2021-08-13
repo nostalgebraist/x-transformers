@@ -58,6 +58,12 @@ class equals():
 def max_neg_value(tensor):
     return -torch.finfo(tensor.dtype).max
 
+def shift(x):
+    x = rearrange(x, '... (r n) -> ... r n', r = 2)
+    x1, x2 = x.unbind(dim = -2)
+    x1 = F.pad(x1, (0, 0, 1, 0), value = 0.)[:, :-1]
+    x = torch.cat((x1, x2), dim = -1)
+    return x
 # keyword argument helpers
 
 def pick_and_pop(keys, d):
@@ -273,6 +279,7 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
+        x = shift(x)
         return self.net(x)
 
 # attention.
@@ -357,6 +364,9 @@ class Attention(nn.Module):
         mem = None
     ):
         b, n, _, h, talking_heads, collab_heads, device, has_context = *x.shape, self.heads, self.talking_heads, self.collab_heads, x.device, exists(context)
+
+        x = shift(x)
+
         kv_input = default(context, x)
 
         q_input = x
