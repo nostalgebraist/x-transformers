@@ -178,7 +178,7 @@ class AlibiPositionalBias(nn.Module):
         self.heads = heads
         slopes = torch.Tensor(self._get_slopes(heads))
         slopes = rearrange(slopes, 'h -> () h () ()')
-        self.register_buffer('slopes', slopes)
+        self.slopes = nn.Parameter(torch.log(slopes))
         self.register_buffer('bias', None)
 
     @staticmethod
@@ -197,12 +197,9 @@ class AlibiPositionalBias(nn.Module):
     def forward(self, qk_dots):
         h, i, j, device = *qk_dots.shape[-3:], qk_dots.device
 
-        if exists(self.bias) and self.bias.shape[-1] >= j:
-            return qk_dots + self.bias[..., :j]
-
         bias = torch.arange(j, device = device)
         bias = rearrange(bias, 'j -> () () () j')
-        bias = bias * self.slopes
+        bias = bias * self.slopes.exp()
         bias = F.pad(bias, (0, 0, 0, 0, 0, h - bias.shape[1]))
         self.register_buffer('bias', bias)
         return qk_dots + self.bias
@@ -875,11 +872,6 @@ class TransformerWrapper(nn.Module):
         self.num_memory_tokens = num_memory_tokens
         if num_memory_tokens > 0:
             self.memory_tokens = nn.Parameter(torch.randn(num_memory_tokens, dim))
-
-            # let funnel encoder know number of memory tokens, if specified
-            # TODO: think of a cleaner solution
-            if hasattr(attn_layers, 'num_memory_tokens'):
-                attn_layers.num_memory_tokens = num_memory_tokens
 
     def init_(self):
         nn.init.normal_(self.token_emb.weight, std = 0.02)
